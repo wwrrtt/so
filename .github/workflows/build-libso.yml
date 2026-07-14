@@ -1,0 +1,137 @@
+name: Build libsingbox.so
+
+on:
+  workflow_dispatch:
+    inputs:
+      singbox_url:
+        description: 'sing-box source zip URL'
+        required: false
+        type: string
+        default: 'https://github.com/SagerNet/sing-box/archive/refs/tags/v1.14.0-alpha.44.zip'
+      version:
+        description: 'Version label, e.g. 1.14.0-alpha.44'
+        required: false
+        type: string
+        default: '1.14.0-alpha.44'
+      tags_extra:
+        description: 'Extra Go build tags (comma-separated)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build .so (linux-amd64)
+    runs-on: ubuntu-20.04
+
+    steps:
+      # ── 1. Check out THIS repo (brings in libso source files) ──
+      - name: Checkout libso overlay
+        uses: actions/checkout@v5
+        with:
+          path: overlay
+
+      # ── 2. Download upstream sing-box source zip ──
+      - name: Download sing-box source
+        run: |
+          set -xeuo pipefail
+          URL="${{ inputs.singbox_url }}"
+          echo "Downloading: $URL"
+          curl -fsSLo sing-box.zip "$URL"
+          unzip -q sing-box.zip
+          # The zip extracts to sing-box-<version>/
+          mv sing-box-* upstream
+          echo "Upstream directory:"
+          ls upstream/
+
+      # ── 3. Merge: overlay libso files into upstream ──
+      - name: Apply libso overlay
+        run: |
+          set -xeuo pipefail
+          if [ -d overlay/experimental/libso ]; then
+            cp -r overlay/experimental/libso upstream/experimental/libso
+            echo "Overlaid experimental/libso/"
+          else
+            echo "::error::overlay/experimental/libso not found"
+            exit 1
+          fi
+          ls -la upstream/experimental/libso/main.go
+          ls -la upstream/experimental/libso/libsingbox.h
+
+      # ── 4. Read required Go version from upstream go.mod ──
+      - name: Read required Go version
+        id: gover
+        run: |
+          GOVER="$(grep -oP '^go \K[0-9.]+' upstream/go.mod)"
+          echo "version=$GOVER" >> "$GITHUB_OUTPUT"
+          echo "Upstream requires Go: $GOVER"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '~${{ steps.gover.outputs.version }}'
+
+      # ── 5. Install musl toolchain ──
+      - name: Install musl-gcc
+        run: |
+          set -xeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          x86_64-linux-musl-gcc --version
+
+      # ── 6. Assemble build tags ──
+      - name: Assemble build tags
+        id: tags
+        run: |
+          TAGS="with_cloudflared,with_quic,with_wireguard,with_utls,with_clash_api"
+          EXTRA='${{ inputs.tags_extra }}'
+          if [ -n "${EXTRA}" ]; then
+            TAGS="${TAGS},${EXTRA}"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Build tags: $TAGS"
+
+      # ── 7. Build libsingbox.so ──
+      - name: Build libsingbox.so
+        run: |
+          set -xeuo pipefail
+
+          cd upstream
+          mkdir -p dist
+
+          VER='${{ inputs.version }}'
+
+          export CGO_ENABLED=1
+          export GOOS=linux
+          export GOARCH=amd64
+          export CC=x86_64-linux-musl-gcc
+
+          go build \
+            -buildmode=c-shared \
+            -v \
+            -trimpath \
+            -tags '${{ steps.tags.outputs.tags }}' \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VER} -s -w -buildid=" \
+            -o dist/libsingbox-linux-amd64.so \
+            ./experimental/libso
+
+          echo "Done. Size:"
+          ls -lh dist/libsingbox-linux-amd64.so
+
+      # ── 8. Package header ──
+      - name: Package artifacts
+        run: |
+          cp upstream/experimental/libso/libsingbox.h upstream/dist/
+
+      # ── 9. Upload ──
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsingbox-linux-amd64
+          path: |
+            upstream/dist/libsingbox-linux-amd64.so
+            upstream/dist/libsingbox.h
+          if-no-files-found: error
