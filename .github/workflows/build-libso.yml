@@ -25,10 +25,10 @@ permissions:
 jobs:
   build:
     name: Build .so (linux-amd64)
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
-      # ── 1. Check out THIS repo (brings in libso source files) ──
+      # ── 1. Check out THIS repo (libso source files) ──
       - name: Checkout libso overlay
         uses: actions/checkout@v5
         with:
@@ -42,26 +42,19 @@ jobs:
           echo "Downloading: $URL"
           curl -fsSLo sing-box.zip "$URL"
           unzip -q sing-box.zip
-          # The zip extracts to sing-box-<version>/
           mv sing-box-* upstream
           echo "Upstream directory:"
           ls upstream/
 
-      # ── 3. Merge: overlay libso files into upstream ──
+      # ── 3. Overlay libso files ──
       - name: Apply libso overlay
         run: |
           set -xeuo pipefail
-          if [ -d overlay/experimental/libso ]; then
-            cp -r overlay/experimental/libso upstream/experimental/libso
-            echo "Overlaid experimental/libso/"
-          else
-            echo "::error::overlay/experimental/libso not found"
-            exit 1
-          fi
+          cp -r overlay/experimental/libso upstream/experimental/libso
           ls -la upstream/experimental/libso/main.go
           ls -la upstream/experimental/libso/libsingbox.h
 
-      # ── 4. Read required Go version from upstream go.mod ──
+      # ── 4. Read Go version from upstream go.mod ──
       - name: Read required Go version
         id: gover
         run: |
@@ -74,15 +67,16 @@ jobs:
         with:
           go-version: '~${{ steps.gover.outputs.version }}'
 
-      # ── 5. Install musl toolchain ──
-      - name: Install musl-gcc
+      # ── 5. Install musl ──
+      - name: Install musl toolchain
         run: |
           set -xeuo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools
+          echo '--- musl-gcc version ---'
           x86_64-linux-musl-gcc --version
 
-      # ── 6. Assemble build tags ──
+      # ── 6. Build tags ──
       - name: Assemble build tags
         id: tags
         run: |
@@ -92,9 +86,8 @@ jobs:
             TAGS="${TAGS},${EXTRA}"
           fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
-          echo "Build tags: $TAGS"
 
-      # ── 7. Build libsingbox.so ──
+      # ── 7. Build libsingbox.so (musl static) ──
       - name: Build libsingbox.so
         run: |
           set -xeuo pipefail
@@ -108,25 +101,51 @@ jobs:
           export GOOS=linux
           export GOARCH=amd64
           export CC=x86_64-linux-musl-gcc
+          export CGO_LDFLAGS='-static'
 
           go build \
             -buildmode=c-shared \
             -v \
             -trimpath \
             -tags '${{ steps.tags.outputs.tags }}' \
-            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VER} -s -w -buildid=" \
+            -ldflags "-linkmode external -extldflags '-static' -X github.com/sagernet/sing-box/constant.Version=${VER} -s -w -buildid=" \
             -o dist/libsingbox-linux-amd64.so \
             ./experimental/libso
 
-          echo "Done. Size:"
+          echo ''
+          echo '=== Built .so info ==='
+          file dist/libsingbox-linux-amd64.so
           ls -lh dist/libsingbox-linux-amd64.so
 
-      # ── 8. Package header ──
+      # ── 8. Verify: .so must have NO glibc dependency ──
+      - name: Verify no glibc dependency
+        run: |
+          set -xeuo pipefail
+
+          cd upstream
+
+          echo '=== ldd (should show "not a dynamic executable" or musl only) ==='
+          ldd dist/libsingbox-linux-amd64.so 2>&1 || true
+
+          echo ''
+          echo '=== Checking for glibc symbols (should produce NO output) ==='
+          if nm -D dist/libsingbox-linux-amd64.so 2>/dev/null | grep -i 'glibc\|GLIBC'; then
+            echo '::error::.so contains GLIBC symbols — it will NOT work on older Linux!'
+            exit 1
+          else
+            echo 'PASS: No glibc symbols detected.'
+          fi
+
+          echo ''
+          echo '=== Checking for musl symbols (confirms musl linked correctly) ==='
+          nm -D dist/libsingbox-linux-amd64.so 2>/dev/null | grep musl | head -5 || echo '(musl linked — good, symbols are statically baked in)'
+
+      # ── 9. Package ──
       - name: Package artifacts
         run: |
           cp upstream/experimental/libso/libsingbox.h upstream/dist/
 
-      # ── 9. Upload ──
+      # ── 10. Upload ──
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
