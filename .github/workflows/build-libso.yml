@@ -118,7 +118,6 @@ jobs:
 
               echo ""
               echo "=== Built .so ==="
-              file /dist/libsingbox-linux-amd64.so
               ls -lh /dist/libsingbox-linux-amd64.so
             '
 
