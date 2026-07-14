@@ -101,14 +101,14 @@ jobs:
           export GOOS=linux
           export GOARCH=amd64
           export CC=x86_64-linux-musl-gcc
-          export CGO_LDFLAGS='-static'
 
           go build \
             -buildmode=c-shared \
             -v \
             -trimpath \
+            -buildvcs=false \
             -tags '${{ steps.tags.outputs.tags }}' \
-            -ldflags "-linkmode external -extldflags '-static' -X github.com/sagernet/sing-box/constant.Version=${VER} -s -w -buildid=" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VER} -s -w -buildid=" \
             -o dist/libsingbox-linux-amd64.so \
             ./experimental/libso
 
