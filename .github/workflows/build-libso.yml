@@ -22,6 +22,13 @@ on:
 permissions:
   contents: write
 
+env:
+  # ── glibc compatibility: build inside ubuntu:20.04 container ──
+  # Resulting .so links against glibc 2.31, runs on:
+  #   Ubuntu 20.04+, Debian 11+, RHEL 9+, and any newer distro.
+  BUILD_IMAGE: ubuntu:20.04
+  GO_VERSION: 1.24.7
+
 jobs:
   build:
     name: Build .so (linux-amd64)
@@ -54,29 +61,7 @@ jobs:
           ls -la upstream/experimental/libso/main.go
           ls -la upstream/experimental/libso/libsingbox.h
 
-      # ── 4. Read Go version from upstream go.mod ──
-      - name: Read required Go version
-        id: gover
-        run: |
-          GOVER="$(grep -oP '^go \K[0-9.]+' upstream/go.mod)"
-          echo "version=$GOVER" >> "$GITHUB_OUTPUT"
-          echo "Upstream requires Go: $GOVER"
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '~${{ steps.gover.outputs.version }}'
-
-      # ── 5. Install musl ──
-      - name: Install musl toolchain
-        run: |
-          set -xeuo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools
-          echo '--- musl-gcc version ---'
-          x86_64-linux-musl-gcc --version
-
-      # ── 6. Build tags ──
+      # ── 4. Assemble build tags ──
       - name: Assemble build tags
         id: tags
         run: |
@@ -86,71 +71,88 @@ jobs:
             TAGS="${TAGS},${EXTRA}"
           fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Build tags: $TAGS"
 
-      # ── 7. Build libsingbox.so (musl static) ──
+      # ── 5. Build inside ubuntu:20.04 container (glibc 2.31) ──
       - name: Build libsingbox.so
         run: |
           set -xeuo pipefail
 
-          cd upstream
           mkdir -p dist
 
+          TAGS='${{ steps.tags.outputs.tags }}'
           VER='${{ inputs.version }}'
+          GO_VER='${{ env.GO_VERSION }}'
 
-          export CGO_ENABLED=1
-          export GOOS=linux
-          export GOARCH=amd64
-          export CC=x86_64-linux-musl-gcc
+          docker run --rm \
+            -v "$(pwd)/upstream:/src" \
+            -v "$(pwd)/dist:/dist" \
+            -w /src \
+            "${{ env.BUILD_IMAGE }}" \
+            bash -exc '
+              # Install build tools
+              apt-get update -qq
+              apt-get install -y -qq wget gcc libc6-dev 1>&2
 
-          go build \
-            -buildmode=c-shared \
-            -v \
-            -trimpath \
-            -buildvcs=false \
-            -tags '${{ steps.tags.outputs.tags }}' \
-            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VER} -s -w -buildid=" \
-            -o dist/libsingbox-linux-amd64.so \
-            ./experimental/libso
+              # Install Go
+              wget -q "https://go.dev/dl/go'"${GO_VER}"'.linux-amd64.tar.gz"
+              tar -C /usr/local -xzf "go'"${GO_VER}"'.linux-amd64.tar.gz"
+              export PATH="/usr/local/go/bin:$PATH"
+              go version
 
-          echo ''
-          echo '=== Built .so info ==='
-          file dist/libsingbox-linux-amd64.so
-          ls -lh dist/libsingbox-linux-amd64.so
+              # Build
+              export CGO_ENABLED=1
+              export GOOS=linux
+              export GOARCH=amd64
 
-      # ── 8. Verify: .so must have NO glibc dependency ──
-      - name: Verify no glibc dependency
+              mkdir -p /dist
+              go build \
+                -buildmode=c-shared \
+                -v \
+                -trimpath \
+                -buildvcs=false \
+                -tags "'"${TAGS}"'" \
+                -ldflags "-X github.com/sagernet/sing-box/constant.Version='"${VER}"' -s -w -buildid=" \
+                -o /dist/libsingbox-linux-amd64.so \
+                ./experimental/libso
+
+              echo ""
+              echo "=== Built .so ==="
+              file /dist/libsingbox-linux-amd64.so
+              ls -lh /dist/libsingbox-linux-amd64.so
+            '
+
+      # ── 6. Verify glibc compatibility ──
+      - name: Verify
         run: |
           set -xeuo pipefail
 
-          cd upstream
-
-          echo '=== ldd (should show "not a dynamic executable" or musl only) ==='
+          echo "=== ldd ==="
           ldd dist/libsingbox-linux-amd64.so 2>&1 || true
 
-          echo ''
-          echo '=== Checking for glibc symbols (should produce NO output) ==='
-          if nm -D dist/libsingbox-linux-amd64.so 2>/dev/null | grep -i 'glibc\|GLIBC'; then
-            echo '::error::.so contains GLIBC symbols — it will NOT work on older Linux!'
-            exit 1
-          else
-            echo 'PASS: No glibc symbols detected.'
-          fi
+          echo ""
+          echo "=== Max GLIBC version required ==="
+          objdump -T dist/libsingbox-linux-amd64.so 2>/dev/null \
+            | grep -oP 'GLIBC_[0-9]+\.[0-9]+' \
+            | sort -Vu \
+            | tail -3 || echo "(none)"
 
-          echo ''
-          echo '=== Checking for musl symbols (confirms musl linked correctly) ==='
-          nm -D dist/libsingbox-linux-amd64.so 2>/dev/null | grep musl | head -5 || echo '(musl linked — good, symbols are statically baked in)'
+          echo ""
+          echo "=== Size ==="
+          ls -lh dist/libsingbox-linux-amd64.so
 
-      # ── 9. Package ──
+      # ── 7. Package ──
       - name: Package artifacts
         run: |
-          cp upstream/experimental/libso/libsingbox.h upstream/dist/
+          cp upstream/experimental/libso/libsingbox.h dist/
+          cp overlay/experimental/libso/test.py dist/ 2>/dev/null || true
 
-      # ── 10. Upload ──
+      # ── 8. Upload ──
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: libsingbox-linux-amd64
           path: |
-            upstream/dist/libsingbox-linux-amd64.so
-            upstream/dist/libsingbox.h
+            dist/libsingbox-linux-amd64.so
+            dist/libsingbox.h
           if-no-files-found: error
