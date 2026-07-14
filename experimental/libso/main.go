@@ -38,6 +38,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"unsafe"
@@ -175,11 +176,13 @@ func singbox_format_config(configJSON *C.char) *C.char {
 		return C.CString("error: " + err.Error())
 	}
 
-	out, err := json.MarshalIndent(opts, "", "  ")
-	if err != nil {
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(opts); err != nil {
 		return C.CString("error: " + err.Error())
 	}
-	return C.CString(string(out))
+	return C.CString(out.String())
 }
 
 //export singbox_check_config
